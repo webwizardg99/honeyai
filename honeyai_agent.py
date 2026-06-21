@@ -35,6 +35,21 @@ MODEL       = os.environ.get("HONEYAI_MODEL", "webwizardg99/wizz:latest")
 SENTINEL_URL = os.environ.get("SENTINEL_URL", "http://127.0.0.1:8282")
 PROFILE_PATH = Path(__file__).parent / "victim_profile.json"
 
+# ── Slack config ───────────────────────────────────────────────────────────────
+
+def _load_slack_token() -> str:
+    t = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not t:
+        env_path = Path.home() / ".env"
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.startswith("SLACK_BOT_TOKEN="):
+                    t = line.split("=", 1)[1].strip()
+    return t
+
+SLACK_TOKEN = _load_slack_token()
+SLACK_API   = "https://slack.com/api/chat.postMessage"
+
 # Max command history kept per session
 MAX_HISTORY = 20
 
@@ -186,6 +201,10 @@ def get_session(session_id: str, attacker_ip: str = "unknown") -> dict:
             "alert_count": 0,
         }
         log.info(f"[+] Új session: {session_id} ({attacker_ip})")
+        asyncio.create_task(slack_post(
+            "#honeypot-activity",
+            f"🍯 Új SSH session | IP: `{attacker_ip}` | Session: `{session_id}` | {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+        ))
     sessions[session_id]["last_seen"] = datetime.utcnow().isoformat()
     return sessions[session_id]
 
@@ -266,6 +285,63 @@ def update_cwd(session: dict, command: str, output: str):
         session["cwd"] = f"/home/{PROFILE['current_user']}"
 
 
+# ── Slack notifier ─────────────────────────────────────────────────────────────
+
+async def slack_post(channel: str, text: str, blocks: list = None):
+    if not SLACK_TOKEN:
+        return
+    payload = {"channel": channel, "text": text}
+    if blocks:
+        payload["blocks"] = blocks
+    try:
+        async with aiohttp.ClientSession() as c:
+            async with c.post(
+                SLACK_API,
+                headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    log.info(f"[slack] → {channel}")
+                else:
+                    log.warning(f"[slack] error {channel}: {data.get('error')}")
+    except Exception as e:
+        log.warning(f"[slack] exception: {e}")
+
+
+async def slack_honeypot_alert(session: dict, command: str, ttps: list[dict], max_severity: int):
+    ip        = session["ip"]
+    sid       = session["id"]
+    cmd_count = session["command_count"]
+    ttp_ids   = ", ".join(t["technique_id"] for t in ttps)
+    ttp_names = ", ".join(t.get("technique_name", t["technique_id"]) for t in ttps)
+    sev_label = ttps[0]["severity"].upper() if ttps else "?"
+    emoji     = "🔴" if max_severity >= 4 else "🟠" if max_severity >= 3 else "🟡"
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"{emoji} HoneyAI — {sev_label} TTP detektálva"}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*IP:*\n`{ip}`"},
+            {"type": "mrkdwn", "text": f"*Session:*\n`{sid}`"},
+            {"type": "mrkdwn", "text": f"*Parancs:*\n`{command[:120]}`"},
+            {"type": "mrkdwn", "text": f"*TTPs:*\n{ttp_ids}"},
+        ]},
+        {"type": "context", "elements": [
+            {"type": "mrkdwn", "text": f"{ttp_names} | Parancsok száma: {cmd_count} | {datetime.utcnow().strftime('%H:%M:%S UTC')}"}
+        ]},
+    ]
+
+    await slack_post("#honeypot-activity", f"{emoji} {ip} — {sev_label}: `{command[:80]}`", blocks)
+
+    # Critical (severity 4+) → nox-alerts is
+    if max_severity >= 4:
+        await slack_post(
+            "#nox-alerts",
+            f"🚨 HoneyAI CRITICAL | {ip} | TTP: {ttp_ids} | `{command[:100]}`"
+        )
+
+
 # ── SENTINEL integration ───────────────────────────────────────────────────────
 
 async def post_sentinel_event(session: dict, command: str, ttps: list[dict]):
@@ -292,6 +368,10 @@ async def post_sentinel_event(session: dict, command: str, ttps: list[dict]):
             )
     except Exception:
         pass  # SENTINEL offline esetén folytatjuk
+
+    # Slack — severity >= 3 (high/critical)
+    if max_severity >= 3:
+        await slack_honeypot_alert(session, command, ttps, max_severity)
 
 
 # ── Delay simulation ───────────────────────────────────────────────────────────
